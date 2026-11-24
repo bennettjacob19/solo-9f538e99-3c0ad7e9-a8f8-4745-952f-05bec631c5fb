@@ -45,7 +45,7 @@ def test_parse_missing_metric_raises():
         parse_metrics_text("up 1\n", "http_request_duration_seconds", 0.0)
 
 
-def _snap(boundaries, cumulative, count, sum_value, pid="p1", at=0.0):
+def _snap(boundaries, cumulative, count, sum_value, pid="p1", at=0.0, table_id=None):
     buckets = dict(zip(boundaries, cumulative))
     return HistogramSnapshot(
         metric_name="m",
@@ -55,6 +55,7 @@ def _snap(boundaries, cumulative, count, sum_value, pid="p1", at=0.0):
         process_id=pid,
         scrape_seq=None,
         scraped_at=at,
+        table_id=table_id,
     )
 
 
@@ -77,6 +78,15 @@ def test_compute_delta_detects_counter_reset():
 def test_compute_delta_rejects_different_bucket_layouts():
     old = _snap([0.1, 0.5], [10, 30], 30, 1.0)
     new = _snap([0.2, 0.5, 1.0], [5, 15, 20], 20, 1.0)
+    with pytest.raises(MetricsParseError):
+        compute_delta(old, new)
+
+
+def test_compute_delta_rejects_layout_change_without_a_table_switch():
+    # Same table id but different boundaries: a malformed exposition.  It must
+    # not be silently treated as a (bridged) switch.
+    old = _snap([0.1, 0.5], [10, 30], 30, 1.0, table_id="t1")
+    new = _snap([0.2, 0.5, 1.0], [5, 15, 20], 20, 1.0, table_id="t1")
     with pytest.raises(MetricsParseError):
         compute_delta(old, new)
 

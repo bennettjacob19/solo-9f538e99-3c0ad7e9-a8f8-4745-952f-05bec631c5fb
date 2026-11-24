@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import httpx
 
+from .buckets import validate_boundaries
 from .histogram import (
+    BucketTransitionError,
     HistogramDelta,
     HistogramSnapshot,
     MetricsParseError,
@@ -36,6 +39,8 @@ SCRAPE_INTERVAL = 1.05
 # Keep the last N scrapes per instance (only the newest two are used).
 HISTORY_LIMIT = 8
 HTTP_TIMEOUT = 2.0
+# Per-instance control endpoint path (relative to the scrape URL's base).
+BUCKETS_PATH = "/buckets"
 
 
 @dataclass
@@ -54,10 +59,52 @@ class InstanceState:
     total_attempts: int = 0
     total_successes: int = 0
     total_failures: int = 0
+    # Last bucket table this instance was verified to be serving.  Once set,
+    # a further switch submission waits until a scrape actually shows this
+    # table ("核查器收到新桶表前拒绝再次换桶").
+    confirmed_table_id: str | None = None
+    # Table id most recently submitted to this instance, for GET /buckets.
+    # ``"pending"`` until a scrape actually shows a different table, then the
+    # received table id.
+    submitted_table: str | None = None
+    submitted_from_table: str | None = None
+    submitted_boundaries: list[float] | None = None
+    submitted_at: float | None = None
+    submitted_process_id: str | None = None
 
     @property
     def latest(self) -> ScrapeRecord | None:
         return self.history[-1] if self.history else None
+
+    @property
+    def control_base(self) -> str:
+        """Base URL of the sample target (strip the ``/metrics`` suffix)."""
+        if self.url.endswith("/metrics"):
+            return self.url[: -len("/metrics")]
+        return self.url.rstrip("/")
+
+
+class SwitchRejected(RuntimeError):
+    """A bucket-table switch was refused; the current table stays in force."""
+
+
+def _safe_json(response: httpx.Response) -> dict | None:
+    try:
+        value = response.json()
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _matches_boundaries(snapshot: HistogramSnapshot, boundaries: list[float] | None) -> bool:
+    """True when a scrape carries exactly the submitted boundary list."""
+
+    if boundaries is None:
+        return False
+    observed = [b for b in snapshot.buckets if math.isfinite(b)]
+    return len(observed) == len(boundaries) and all(
+        abs(a - b) <= 1e-12 for a, b in zip(observed, boundaries)
+    )
 
 
 @dataclass
@@ -71,6 +118,14 @@ class ReadySample:
     @property
     def sample_times(self) -> tuple[float, float]:
         return self.earlier.at, self.later.at
+
+    @property
+    def crosses_table_change(self) -> bool:
+        return self.delta.crosses_table_change
+
+    @property
+    def table_ids(self) -> list[str | None]:
+        return self.delta.table_ids
 
 
 class ScrapeStore:
@@ -92,6 +147,9 @@ class ScrapeStore:
         self._cond = asyncio.Condition()
         self._task: asyncio.Task | None = None
         self._client: httpx.AsyncClient | None = None
+        # Serialises the check-then-submit sequence for bucket switches, so
+        # two concurrent submissions cannot both pass the pending gate.
+        self._switch_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -125,6 +183,8 @@ class ScrapeStore:
             )
             record = ScrapeRecord(ok=True, at=snapshot.scraped_at, snapshot=snapshot)
             state.total_successes += 1
+            if snapshot.table_id is not None:
+                state.confirmed_table_id = snapshot.table_id
         except (httpx.HTTPError, MetricsParseError, ValueError) as exc:
             record = ScrapeRecord(ok=False, at=time.time(), error=f"{type(exc).__name__}: {exc}")
             state.total_failures += 1
@@ -183,6 +243,9 @@ class ScrapeStore:
             return "process_restarted"
         try:
             delta = compute_delta(earlier.snapshot, later.snapshot)
+        except BucketTransitionError:
+            # A bucket switch happened without a usable old-table bridge.
+            return "bucket_table_changed"
         except MetricsParseError:
             # A counter reset means a restart slipped past process labels.
             return "process_restarted"
@@ -224,6 +287,229 @@ class ScrapeStore:
                     pass
 
     # ------------------------------------------------------------------ #
+    # Bucket-table switches
+    # ------------------------------------------------------------------ #
+
+    def _publish_gate(self, name: str) -> str | None:
+        """Return a rejection reason if a switch must not be submitted yet.
+
+        The verifier only accepts a further table once it has *received* the
+        previously submitted one, i.e. a scrape shows the submitted source
+        table ("核查器收到新桶表前拒绝再次换桶").  Receipt is matched by the
+        boundary list, so an unrelated table from a restarted target can never
+        satisfy the gate.
+        """
+
+        state = self.instances[name]
+        if state.submitted_table != "pending":
+            return None
+        latest = state.latest
+        if (
+            latest is not None
+            and latest.ok
+            and latest.snapshot is not None
+            and _matches_boundaries(latest.snapshot, state.submitted_boundaries)
+            and (
+                latest.snapshot.table_id is None
+                or latest.snapshot.table_id != state.submitted_from_table
+            )
+        ):
+            # The submitted table has been observed: the switch is complete.
+            state.submitted_table = latest.snapshot.table_id or "received"
+            state.confirmed_table_id = latest.snapshot.table_id
+            return None
+        if (
+            latest is not None
+            and latest.ok
+            and latest.snapshot is not None
+            and state.submitted_process_id is not None
+            and latest.snapshot.process_id != state.submitted_process_id
+        ):
+            # The sample restarted after the submission but never reported the
+            # submitted table: it is gone.  Reopen the gate instead of wedging
+            # it forever; the lost switch is surfaced through /buckets.
+            state.submitted_table = None
+            return None
+        return (
+            "上一份新桶表尚未在抓取中出现（核查器还没收到新桶表），"
+            "拒绝再次换桶"
+        )
+
+    def switch_block_reason(self, name: str) -> str | None:
+        """Public gate check: ``None`` means a further switch is allowed."""
+        return self._publish_gate(name)
+
+    async def submit_bucket_table(
+        self, name: str, boundaries: list[float]
+    ) -> dict:
+        """Validate and forward a new bucket table to one sample target.
+
+        The switch is requested through the target's ``POST /buckets``.  It
+        takes effect at the target's next successful scrape, at the latest.
+        Raises :class:`BucketValidationError` for an invalid table and
+        :class:`SwitchRejected` if the previous switch has not been observed
+        or another submission is already in flight.
+        """
+
+        validated = validate_boundaries(boundaries)
+        if name not in self.instances:
+            raise KeyError(name)
+        if self._client is None:
+            raise RuntimeError("store is not running")
+
+        async with self._switch_lock:
+            return await self._submit_locked(name, validated)
+
+    async def _submit_locked(self, name: str, validated: list[float]) -> dict:
+        reason = self._publish_gate(name)
+        if reason is not None:
+            raise SwitchRejected(reason)
+
+        state = self.instances[name]
+        url = f"{state.control_base}{BUCKETS_PATH}"
+        previous_table_id = (
+            state.latest.snapshot.table_id
+            if state.latest is not None
+            and state.latest.ok
+            and state.latest.snapshot is not None
+            else None
+        )
+        try:
+            response = await self._client.post(
+                url, json={"boundaries": validated}
+            )
+        except httpx.HTTPError as exc:
+            raise SwitchRejected(f"无法提交桶表到 {name}: {exc}") from exc
+        if response.status_code == 409:
+            raise SwitchRejected(
+                f"{name} 仍在等待上一次换桶生效，拒绝再次换桶"
+            )
+        if response.status_code == 400:
+            detail = ""
+            try:
+                detail = str(response.json().get("detail", ""))
+            except ValueError:
+                detail = response.text
+            raise BucketValidationError(detail or "桶表被样例目标拒绝")
+        if response.status_code >= 400:
+            raise SwitchRejected(
+                f"提交桶表到 {name} 失败: HTTP {response.status_code} "
+                f"{response.text[:200]}"
+            )
+
+        state.submitted_table = "pending"
+        state.submitted_from_table = previous_table_id
+        state.submitted_boundaries = validated
+        state.submitted_at = time.time()
+        state.submitted_process_id = (
+            state.latest.snapshot.process_id
+            if state.latest is not None
+            and state.latest.ok
+            and state.latest.snapshot is not None
+            else None
+        )
+        async with self._cond:
+            self._cond.notify_all()
+        return {
+            "instance": name,
+            "accepted": True,
+            "boundaries": validated,
+            "previous_table_id": previous_table_id,
+            "target_response": _safe_json(response),
+        }
+
+    async def submit_bucket_table_all(
+        self, names: list[str], boundaries: list[float]
+    ) -> list[dict]:
+        """Submit the same table to several instances, all-or-nothing.
+
+        Every instance is validated and gate-checked before the first request
+        is sent, so an invalid table or a not-yet-received previous switch
+        cannot leave the group half-switched.
+        """
+
+        validated = validate_boundaries(boundaries)
+        unknown = [name for name in names if name not in self.instances]
+        if unknown:
+            raise KeyError(unknown[0])
+        if self._client is None:
+            raise RuntimeError("store is not running")
+
+        async with self._switch_lock:
+            for name in names:
+                reason = self._publish_gate(name)
+                if reason is not None:
+                    raise SwitchRejected(f"{name}: {reason}")
+            # Pre-flight passed for the whole group; now submit each one.
+            # A target that accepted the table cannot be rolled back, so a
+            # mid-flight failure is reported rather than silently retried.
+            return [
+                await self._submit_locked(name, validated) for name in names
+            ]
+
+    async def wait_until_table_changed(
+        self, name: str, previous_table_id: str | None, deadline: float
+    ) -> HistogramSnapshot | None:
+        """Wait for a scrape whose bucket table differs from ``previous``.
+
+        Returns the first such snapshot, or ``None`` on timeout.  This is how
+        the verifier learns that a submitted table has actually been received
+        ("收到新桶表"), after which another switch may be submitted.
+        """
+
+        while True:
+            state = self.instances[name]
+            latest = state.latest
+            if (
+                latest is not None
+                and latest.ok
+                and latest.snapshot is not None
+                and latest.snapshot.table_id is not None
+                and latest.snapshot.table_id != previous_table_id
+            ):
+                state.confirmed_table_id = latest.snapshot.table_id
+                state.submitted_table = latest.snapshot.table_id
+                return latest.snapshot
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            async with self._cond:
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
+    async def fetch_target_switch_status(self, name: str) -> dict | None:
+        """Ask the sample target itself for its switch progress.
+
+        Returns ``None`` when the target cannot be reached or does not expose
+        the control endpoint (e.g. an external Prometheus target).
+        """
+
+        state = self.instances[name]
+        if self._client is None:
+            return None
+        try:
+            response = await self._client.get(
+                f"{state.control_base}{BUCKETS_PATH}"
+            )
+            if response.status_code >= 400:
+                return None
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        return {
+            "status": body.get("status"),
+            "current_table": body.get("current_table"),
+            "retro_table": body.get("retro_table"),
+            "pending_boundaries": body.get("pending_boundaries"),
+            "last_switch_at": body.get("last_switch_at"),
+            "switch_count": body.get("switch_count"),
+        }
+
+    # ------------------------------------------------------------------ #
     # Observability
     # ------------------------------------------------------------------ #
 
@@ -246,6 +532,11 @@ class ScrapeStore:
                 "last_process_id": (
                     last_ok.snapshot.process_id if last_ok and last_ok.snapshot else None
                 ),
+                "current_table_id": state.confirmed_table_id,
+                "submitted_table": state.submitted_table,
+                "submitted_from_table": state.submitted_from_table,
+                "submitted_boundaries": state.submitted_boundaries,
+                "submitted_at": state.submitted_at,
             }
         return result
 
